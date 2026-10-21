@@ -1,11 +1,23 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from typing import Literal
+import base64
+import hashlib
+import hmac
 import os
 import pandas as pd
 import io
+import secrets
+import time
+import zipfile
 from datetime import datetime, timedelta
+from openpyxl.utils.exceptions import InvalidFileException
+from xlrd.biffh import XLRDError
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -68,11 +80,58 @@ class LigneDemande(Base):
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Flux Coupe API V13")
+bearer_scheme = HTTPBearer(auto_error=False)
+active_sessions = {}
+PASSWORD_HASH_ITERATIONS = 600000
 
 def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_HASH_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        PASSWORD_HASH_ITERATIONS,
+        base64.urlsafe_b64encode(salt).decode(),
+        base64.urlsafe_b64encode(digest).decode(),
+    )
+
+def verify_password(password: str, stored_password: str) -> bool:
+    if not stored_password.startswith("pbkdf2_sha256$"):
+        return hmac.compare_digest(password, stored_password)
+    try:
+        _, iterations, salt, expected_digest = stored_password.split("$")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode(),
+            base64.urlsafe_b64decode(salt),
+            int(iterations),
+        )
+        return hmac.compare_digest(
+            base64.urlsafe_b64encode(digest).decode(),
+            expected_digest,
+        )
+    except (ValueError, TypeError):
+        return False
+
+def require_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    session = active_sessions.get(credentials.credentials)
+    user_id = session[0] if session and session[1] > time.time() else None
+    if session and user_id is None:
+        active_sessions.pop(credentials.credentials, None)
+    user = db.query(Utilisateur).filter(Utilisateur.id == user_id).first() if user_id else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Session invalide, veuillez vous reconnecter")
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Accès réservé à l'administrateur")
+    return user
 
 @app.on_event("startup")
 def startup_event():
@@ -85,6 +144,10 @@ def startup_event():
             Utilisateur(username="coupe", password="123", role="coupeur"),
         ])
         db.commit()
+    for user in db.query(Utilisateur).all():
+        if user.password and not user.password.startswith("pbkdf2_sha256$"):
+            user.password = hash_password(user.password)
+    db.commit()
     db.close()
 
 class UserLogin(BaseModel):
@@ -94,12 +157,12 @@ class UserLogin(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: str
+    role: Literal["admin", "planificateur", "magasinier", "coupeur"]
 
 class UserUpdate(BaseModel):
     username: str
-    password: str
-    role: str
+    password: str = ""
+    role: Literal["admin", "planificateur", "magasinier", "coupeur"]
 
 class NomCreate(BaseModel):
     projet: str
@@ -130,37 +193,84 @@ class LigneUpdateCoupeur(BaseModel):
 
 @app.post("/auth/login")
 def login(user: UserLogin, db: Session = Depends(get_db)):
-    u = db.query(Utilisateur).filter(Utilisateur.username == user.username, Utilisateur.password == user.password).first()
-    if not u: raise HTTPException(status_code=401, detail="Identifiants invalides")
-    return {"id": u.id, "username": u.username, "role": u.role}
+    u = db.query(Utilisateur).filter(Utilisateur.username == user.username).first()
+    if not u or not verify_password(user.password, u.password):
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    if not u.password.startswith("pbkdf2_sha256$"):
+        u.password = hash_password(user.password)
+        db.commit()
+    token = secrets.token_urlsafe(32)
+    active_sessions[token] = (u.id, time.time() + 8 * 60 * 60)
+    return {"id": u.id, "username": u.username, "role": u.role, "access_token": token}
+
+@app.post("/auth/logout")
+def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    active_sessions.pop(credentials.credentials, None)
+    return {"message": "Déconnexion réussie"}
 
 @app.get("/users/")
-def get_users(db: Session = Depends(get_db)):
-    return db.query(Utilisateur).order_by(Utilisateur.id).all()
+def get_users(db: Session = Depends(get_db), _: Utilisateur = Depends(require_admin)):
+    users = db.query(Utilisateur).order_by(Utilisateur.id).all()
+    return [{"id": user.id, "username": user.username, "role": user.role} for user in users]
 
 @app.post("/users/")
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    u = Utilisateur(username=user.username, password=user.password, role=user.role)
+def create_user(user: UserCreate, db: Session = Depends(get_db), _: Utilisateur = Depends(require_admin)):
+    username = user.username.strip()
+    if not username or len(username) > 80 or not user.password:
+        raise HTTPException(status_code=400, detail="Identifiant et mot de passe obligatoires")
+    u = Utilisateur(username=username, password=hash_password(user.password), role=user.role)
     db.add(u)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Cet identifiant existe déjà")
     return {"message": "Utilisateur créé"}
 
 @app.put("/users/{user_id}")
-def update_user(user_id: int, user: UserUpdate, db: Session = Depends(get_db)):
+def update_user(user_id: int, user: UserUpdate, db: Session = Depends(get_db), current_admin: Utilisateur = Depends(require_admin)):
     u = db.query(Utilisateur).filter(Utilisateur.id == user_id).first()
-    if u:
-        u.username = user.username
-        if user.password: u.password = user.password
-        u.role = user.role
+    if not u:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    username = user.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Identifiant obligatoire")
+    if len(username) > 80:
+        raise HTTPException(status_code=400, detail="L'identifiant ne peut pas dépasser 80 caractères")
+    if u.id == current_admin.id and user.role != "admin":
+        raise HTTPException(status_code=400, detail="Vous ne pouvez pas retirer votre propre rôle administrateur")
+    if u.role == "admin" and user.role != "admin":
+        admin_count = db.query(Utilisateur).filter(Utilisateur.role == "admin").count()
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Impossible de retirer le dernier administrateur")
+    u.username = username
+    if user.password:
+        u.password = hash_password(user.password)
+    u.role = user.role
+    try:
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Cet identifiant existe déjà")
     return {"message": "Utilisateur modifié"}
 
 @app.delete("/users/{user_id}")
-def delete_user(user_id: int, db: Session = Depends(get_db)):
+def delete_user(user_id: int, db: Session = Depends(get_db), current_admin: Utilisateur = Depends(require_admin)):
     u = db.query(Utilisateur).filter(Utilisateur.id == user_id).first()
-    if u:
-        db.delete(u)
-        db.commit()
+    if not u:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    if u.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="Vous ne pouvez pas supprimer votre propre compte")
+    if u.role == "admin":
+        admin_count = db.query(Utilisateur).filter(Utilisateur.role == "admin").count()
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Impossible de supprimer le dernier administrateur")
+    db.delete(u)
+    db.commit()
     return {"message": "Utilisateur supprimé"}
 
 @app.get("/nomenclatures/all")
@@ -181,15 +291,33 @@ def delete_nomenclature(nom_id: int, db: Session = Depends(get_db)):
         db.commit()
     return {"message": "Nomenclature supprimée"}
 
+@app.get("/nomenclatures/export")
+def export_nomenclatures(db: Session = Depends(get_db)):
+    columns = [
+        "projet", "vehicule", "version", "ref_tissu",
+        "abr_tissu", "description_tissu", "conso_par_kit",
+    ]
+    nomenclatures = db.query(VehiculeNomenclature).order_by(
+        VehiculeNomenclature.projet, VehiculeNomenclature.vehicule
+    ).all()
+    rows = [{column: getattr(nom, column) for column in columns} for nom in nomenclatures]
+    output = io.BytesIO()
+    pd.DataFrame(rows, columns=columns).to_excel(output, index=False, engine="openpyxl")
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="nomenclatures.xlsx"'},
+    )
+
 @app.post("/nomenclatures/upload")
 async def upload_nomenclatures(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
+        filename = (file.filename or "").lower()
+        if not filename.endswith((".xlsx", ".xls")):
+            raise HTTPException(status_code=400, detail="Veuillez sélectionner un fichier Excel (.xlsx ou .xls).")
         contents = await file.read()
-        if file.filename.endswith('.csv'):
-            try: df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='utf-8')
-            except UnicodeDecodeError: df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='latin1')
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
+        df = pd.read_excel(io.BytesIO(contents))
             
         df.columns = [str(c).strip().lower() for c in df.columns]
         def get_val(row, keys):
@@ -213,6 +341,12 @@ async def upload_nomenclatures(file: UploadFile = File(...), db: Session = Depen
             ))
         db.commit()
         return {"message": "Import réussi !"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except (ValueError, ImportError, zipfile.BadZipFile, InvalidFileException, XLRDError) as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Fichier Excel invalide : {e}")
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

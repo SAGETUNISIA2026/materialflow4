@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 
 const formatDate = (dateString) => {
   if (!dateString) return '-';
@@ -22,13 +23,28 @@ function App() {
 
   if (!user) return <Login onLogin={(u) => { setUser(u); setView(u.role === 'admin' ? 'dashboard' : u.role); }} />;
 
+  const handleLogout = async () => {
+    try {
+      const response = await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${user.access_token}` }
+      });
+      if (!response.ok) throw new Error();
+    } catch {
+      alert("La déconnexion sécurisée a échoué. Veuillez contacter l'administrateur.");
+    } finally {
+      setUser(null);
+      setView('');
+    }
+  };
+
   return (
     <div className="container">
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem'}}>
         <h1>Gestion ERP des Flux Matière</h1>
         <div style={{fontSize: '1.2rem', color: '#6b7280'}}>
           Connecté: <strong>{user.username}</strong> ({user.role}) 
-          <button className="btn-sm btn-outline" style={{marginLeft: '1rem'}} onClick={() => setUser(null)}>Déconnexion</button>
+          <button className="btn-sm btn-outline" style={{marginLeft: '1rem'}} onClick={handleLogout}>Déconnexion</button>
         </div>
       </div>
       
@@ -44,7 +60,7 @@ function App() {
       {view === 'planificateur' && <Planificateur />}
       {view === 'magasinier' && <Magasinier />}
       {view === 'coupeur' && <Coupeur />}
-      {view === 'admin' && <AdminPanel />}
+      {view === 'admin' && user.role === 'admin' && <AdminPanel token={user.access_token} />}
     </div>
   );
 }
@@ -197,7 +213,15 @@ function Dashboard() {
 
 const DemandesTable = ({ demandes, role, chargerDemandes }) => {
   const [expandedIds, setExpandedIds] = useState([]);
+  const [demandeAImprimer, setDemandeAImprimer] = useState(null);
   const toggleExpand = (id) => setExpandedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+
+  useEffect(() => {
+    if (demandeAImprimer) {
+      window.print();
+      setDemandeAImprimer(null);
+    }
+  }, [demandeAImprimer]);
 
   const updateLigne = (ligneId, endpoint, payload) => {
     fetch(`/api/lignes/${ligneId}/${endpoint}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
@@ -221,6 +245,7 @@ const DemandesTable = ({ demandes, role, chargerDemandes }) => {
   if (demandes.length === 0) return <p style={{fontStyle: 'italic', textAlign: 'center', fontSize: '1.4rem', color: '#6b7280', marginTop: '2rem'}}>Aucune demande à afficher.</p>;
 
   return (
+    <>
     <table className="main-table">
       <thead>
         <tr>
@@ -255,6 +280,9 @@ const DemandesTable = ({ demandes, role, chargerDemandes }) => {
                       {(role === 'planificateur' || role === 'admin') && (
                         <button className="btn-icon text-danger" onClick={(e) => { e.stopPropagation(); supprimerDemande(d.id); }} title="Supprimer">🗑️</button>
                       )}
+                      <button className="btn-sm btn-outline" onClick={(e) => { e.stopPropagation(); setDemandeAImprimer(d); }} title={`Imprimer la demande #${d.id}`}>
+                        🖨️ Imprimer
+                      </button>
                       <span className={`badge ${getBadgeClass(d.statut)}`}>{d.statut}</span>
                     </span>
                     <span style={{fontSize: '1.5rem', color: '#9ca3af'}}>{expandedIds.includes(d.id) ? '▴' : '▾'}</span>
@@ -315,6 +343,41 @@ const DemandesTable = ({ demandes, role, chargerDemandes }) => {
         ))}
       </tbody>
     </table>
+    {demandeAImprimer && createPortal(
+      <section className="print-demand">
+        <h1>Demande de matière #{demandeAImprimer.id}</h1>
+        <div className="print-demand-meta">
+          <p><strong>Projet :</strong> {demandeAImprimer.projet.toUpperCase()}</p>
+          <p><strong>Véhicule :</strong> {demandeAImprimer.vehicule}</p>
+          <p><strong>Quantité de véhicules :</strong> {demandeAImprimer.quantite_vehicules}</p>
+          <p><strong>Statut :</strong> {demandeAImprimer.statut}</p>
+          <p><strong>Date de création :</strong> {formatDate(demandeAImprimer.date_creation)}</p>
+          <p><strong>Date de lancement :</strong> {formatDate(demandeAImprimer.date_lancement)}</p>
+        </div>
+        <table className="print-demand-table">
+          <thead>
+            <tr>
+              <th>Référence</th>
+              <th>Abr-Tissu</th>
+              <th>Qté demandée (m)</th>
+              <th>Qté préparée (m)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {demandeAImprimer.lignes.map(ligne => (
+              <tr key={ligne.id}>
+                <td>{ligne.ref_tissu}</td>
+                <td>{ligne.abr_tissu}</td>
+                <td>{ligne.quantite_demandee}</td>
+                <td>{ligne.quantite_preparee ?? '-'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>,
+      document.body
+    )}
+    </>
   );
 };
 
@@ -382,7 +445,7 @@ function Coupeur() {
 }
 
 // === ADMINISTRATION ===
-function AdminPanel() {
+function AdminPanel({ token }) {
   const [tab, setTab] = useState('users');
   return (
     <div>
@@ -391,56 +454,184 @@ function AdminPanel() {
         <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>👥 Utilisateurs</button>
         <button className={tab === 'noms' ? 'active' : ''} onClick={() => setTab('noms')}>📚 Nomenclatures</button>
       </div>
-      {tab === 'users' && <AdminUsers />}
+      {tab === 'users' && <AdminUsers token={token} />}
       {tab === 'noms' && <AdminNomenclatures />}
     </div>
   );
 }
 
-function AdminUsers() {
+function AdminUsers({ token }) {
   const [users, setUsers] = useState([]);
-  const [newUser, setNewUser] = useState({username: '', password: '', role: 'planificateur'});
+  const [form, setForm] = useState({username: '', password: '', role: 'planificateur'});
   const [editingId, setEditingId] = useState(null);
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [search, setSearch] = useState('');
+  const adminErrorMessage = "Une erreur est survenue. Veuillez contacter l'administrateur.";
+  const adminHeaders = { Authorization: `Bearer ${token}` };
+  const emptyForm = {username: '', password: '', role: 'planificateur'};
 
-  const loadUsers = () => fetch('/api/users/').then(r => r.json()).then(setUsers);
+  const loadUsers = async () => {
+    try {
+      const response = await fetch('/api/users/', { headers: adminHeaders });
+      if (!response.ok) throw new Error();
+      setUsers(await response.json());
+    } catch {
+      alert(adminErrorMessage);
+    } finally {
+      setIsLoading(false);
+    }
+  };
   useEffect(() => { loadUsers(); }, []);
 
-  const saveUser = () => {
-    if (editingId) {
-      fetch(`/api/users/${editingId}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(newUser) })
-      .then(() => { loadUsers(); setNewUser({username: '', password: '', role: 'planificateur'}); setEditingId(null); });
-    } else {
-      fetch('/api/users/', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(newUser) })
-      .then(() => { loadUsers(); setNewUser({username: '', password: '', role: 'planificateur'}); });
+  const closeForm = () => {
+    setForm(emptyForm);
+    setEditingId(null);
+    setIsFormOpen(false);
+  };
+
+  const saveUser = async () => {
+    if (!form.username.trim() || (!editingId && !form.password)) {
+      alert('Veuillez renseigner un identifiant et un mot de passe.');
+      return;
+    }
+    setIsSaving(true);
+    try {
+      const isEditing = Boolean(editingId);
+      const response = await fetch(isEditing ? `/api/users/${editingId}` : '/api/users/', {
+        method: isEditing ? 'PUT' : 'POST',
+        headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...form, username: form.username.trim() })
+      });
+      if (!response.ok) throw new Error();
+      closeForm();
+      await loadUsers();
+    } catch {
+      alert(adminErrorMessage);
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const startEdit = (u) => { setEditingId(u.id); setNewUser({username: u.username, password: '', role: u.role}); };
-  const deleteUser = (id) => { if(window.confirm("Supprimer l'utilisateur ?")) fetch(`/api/users/${id}`, {method: 'DELETE'}).then(loadUsers); };
+  const startEdit = (u) => {
+    setEditingId(u.id);
+    setForm({username: u.username, password: '', role: u.role});
+    setIsFormOpen(true);
+  };
+
+  const startCreate = () => {
+    setEditingId(null);
+    setForm(emptyForm);
+    setIsFormOpen(true);
+  };
+
+  const deleteUser = async (id) => {
+    if (!window.confirm("Supprimer l'utilisateur ?")) return;
+    try {
+      const response = await fetch(`/api/users/${id}`, { method: 'DELETE', headers: adminHeaders });
+      if (!response.ok) throw new Error();
+      await loadUsers();
+    } catch {
+      alert(adminErrorMessage);
+    }
+  };
+
+  const roleLabels = {
+    admin: 'Administrateur',
+    planificateur: 'Planificateur',
+    magasinier: 'Magasinier',
+    coupeur: 'Coupeur'
+  };
+  const filteredUsers = users.filter(user =>
+    `${user.username} ${roleLabels[user.role] || user.role}`.toLowerCase().includes(search.toLowerCase())
+  );
 
   return (
-    <div className="card">
-      <div className="creation-bar" style={{marginBottom: '2rem'}}>
-        <input placeholder="Identifiant" value={newUser.username} onChange={e => setNewUser({...newUser, username: e.target.value})} />
-        <input placeholder={editingId ? "Nouveau mot de passe" : "Mot de passe"} value={newUser.password} onChange={e => setNewUser({...newUser, password: e.target.value})} />
-        <select value={newUser.role} onChange={e => setNewUser({...newUser, role: e.target.value})}>
-          <option value="admin">Administrateur</option><option value="planificateur">Planificateur</option>
-          <option value="magasinier">Magasinier</option><option value="coupeur">Coupeur</option>
-        </select>
-        <button onClick={saveUser} className="btn-success">{editingId ? "Modifier" : "Ajouter"}</button>
-        {editingId && <button onClick={() => {setEditingId(null); setNewUser({username:'', password:'', role:'planificateur'})}} className="btn-outline">Annuler</button>}
-      </div>
-      <table className="main-table">
-        <thead><tr><th>ID</th><th>Identifiant</th><th>Rôle</th><th>Action</th></tr></thead>
-        <tbody>
-          {users.map(u => (
-            <tr key={u.id}>
-              <td>{u.id}</td><td>{u.username}</td><td>{u.role}</td>
-              <td><button className="btn-warning btn-sm" onClick={() => startEdit(u)}>Modifier</button> <button className="btn-danger btn-sm" onClick={() => deleteUser(u.id)}>Supprimer</button></td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="admin-users">
+      <section className="admin-users-heading">
+        <div>
+          <h3>Gestion des utilisateurs</h3>
+          <p>Créez les comptes et attribuez uniquement le rôle nécessaire.</p>
+        </div>
+        <button className="btn-primary" onClick={startCreate}>Ajouter un utilisateur</button>
+      </section>
+
+      {isFormOpen && (
+        <form className="admin-user-form card" onSubmit={e => { e.preventDefault(); saveUser(); }}>
+          <h4>{editingId ? 'Modifier le compte' : 'Nouveau compte'}</h4>
+          <div className="admin-user-fields">
+            <label>
+              Identifiant
+              <input
+                autoComplete="off"
+                maxLength="80"
+                value={form.username}
+                onChange={e => setForm({...form, username: e.target.value})}
+                required
+              />
+            </label>
+            <label>
+              {editingId ? 'Nouveau mot de passe (facultatif)' : 'Mot de passe'}
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={form.password}
+                onChange={e => setForm({...form, password: e.target.value})}
+                required={!editingId}
+              />
+            </label>
+            <label>
+              Rôle
+              <select value={form.role} onChange={e => setForm({...form, role: e.target.value})}>
+                <option value="planificateur">Planificateur</option>
+                <option value="magasinier">Magasinier</option>
+                <option value="coupeur">Coupeur</option>
+                <option value="admin">Administrateur</option>
+              </select>
+            </label>
+          </div>
+          <div className="admin-user-form-actions">
+            <button type="submit" className="btn-success" disabled={isSaving}>
+              {isSaving ? 'Enregistrement...' : editingId ? 'Enregistrer' : 'Créer le compte'}
+            </button>
+            <button type="button" className="btn-outline" onClick={closeForm} disabled={isSaving}>Annuler</button>
+          </div>
+        </form>
+      )}
+
+      <section className="admin-user-list card">
+        <div className="admin-user-list-heading">
+          <h4>Comptes ({users.length})</h4>
+          <input
+            type="search"
+            aria-label="Rechercher un utilisateur"
+            placeholder="Rechercher un compte..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+        </div>
+        {isLoading ? <p className="admin-user-status">Chargement des comptes...</p> : (
+          <div className="admin-user-table-wrap">
+            <table className="main-table">
+              <thead><tr><th>Identifiant</th><th>Rôle</th><th>Actions</th></tr></thead>
+              <tbody>
+                {filteredUsers.map(user => (
+                  <tr key={user.id}>
+                    <td><strong>{user.username}</strong></td>
+                    <td><span className="admin-role-badge">{roleLabels[user.role] || user.role}</span></td>
+                    <td className="admin-user-actions">
+                      <button className="btn-outline btn-sm" onClick={() => startEdit(user)}>Modifier</button>
+                      <button className="btn-danger btn-sm" onClick={() => deleteUser(user.id)}>Supprimer</button>
+                    </td>
+                  </tr>
+                ))}
+                {!filteredUsers.length && <tr><td colSpan="3" className="admin-user-status">Aucun compte correspondant.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }
@@ -448,6 +639,8 @@ function AdminUsers() {
 function AdminNomenclatures() {
   const [noms, setNoms] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const fileInputRef = useRef(null);
   
   const loadNoms = () => fetch('/api/nomenclatures/all').then(r => r.json()).then(setNoms);
   useEffect(() => { loadNoms(); }, []);
@@ -460,7 +653,28 @@ function AdminNomenclatures() {
     .then(async (res) => { const data = await res.json(); if (!res.ok) throw new Error(data.detail); return data; })
     .then(data => { alert(data.message); loadNoms(); })
     .catch(err => alert(err.message)).finally(() => setIsUploading(false));
-    e.target.value = null;
+    e.target.value = '';
+  };
+
+  const handleFileExport = async () => {
+    setIsExporting(true);
+    try {
+      const response = await fetch('/api/nomenclatures/export');
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.detail || "Échec de l'export Excel");
+      }
+      const fileUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = fileUrl;
+      link.download = 'nomenclatures.xlsx';
+      link.click();
+      URL.revokeObjectURL(fileUrl);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const deleteNom = (id) => { if(window.confirm("Supprimer ?")) fetch(`/api/nomenclatures/${id}`, {method: 'DELETE'}).then(loadNoms); };
@@ -469,8 +683,10 @@ function AdminNomenclatures() {
     <div className="card">
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem'}}>
         <h3>Base des véhicules / Tissus</h3>
-        <div>
-           <input type="file" accept=".csv, .xlsx, .xls" onChange={handleFileUpload} disabled={isUploading} style={{fontSize: '1rem'}}/>
+        <div style={{display: 'flex', alignItems: 'center', gap: '0.75rem'}}>
+           <input ref={fileInputRef} type="file" accept=".xlsx, .xls" onChange={handleFileUpload} disabled={isUploading} style={{display: 'none'}}/>
+           <button className="btn-primary" onClick={() => fileInputRef.current?.click()} disabled={isUploading}>Importer Excel</button>
+           <button className="btn-outline" onClick={handleFileExport} disabled={isExporting}>{isExporting ? 'Export...' : 'Exporter Excel'}</button>
            {isUploading && <span style={{color: '#3b82f6'}}>Import... ⏳</span>}
         </div>
       </div>
